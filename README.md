@@ -52,26 +52,6 @@ Use the **Download template CSV** button in the app to get a pre-filled example 
 
 ---
 
-## Running locally
-
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
----
-
-## Deploying to Streamlit Cloud
-
-1. Push this repository to GitHub
-2. Go to [share.streamlit.io](https://share.streamlit.io) and sign in
-3. Click **New app** → select your repository → set main file to `app.py`
-4. Click **Deploy**
-
-No secrets configuration is needed — credentials are entered at runtime in the sidebar.
-
----
-
 ## API reference
 
 Full schema documentation: [hypatos.redocly.app/openapi/enrichment](https://hypatos.redocly.app/openapi/enrichment)
