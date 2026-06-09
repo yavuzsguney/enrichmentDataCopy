@@ -420,7 +420,7 @@ def _pick_token_field(data: dict):
     return None
 
 
-def get_token(base_url: str, client_id: str, client_secret: str, extra_headers: dict | None = None):
+def get_token(base_url: str, client_id: str, client_secret: str, extra_headers: Optional[dict] = None):
     """Try several auth payload/encoding variants. Returns (ok: bool, token_or_error: str)."""
     url = base_url.rstrip("/") + AUTH_PATH
     hdr_base = {"Accept": "application/json"}
@@ -537,7 +537,7 @@ def load_table(uploaded_file) -> pd.DataFrame:
             return str(val)
         return str(val)
 
-    df = df.applymap(_normalize)
+    df = df.map(_normalize)
     return df
 
 
