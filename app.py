@@ -3,6 +3,7 @@ import json
 import math
 import re
 import time
+from urllib.parse import quote
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -776,6 +777,294 @@ def page_endpoint(endpoint_key: str, config: dict, base_url: str, auth_headers: 
 
 
 # =============================================================================
+# PATCH SUPPORT (added)
+# Batch-update existing records via merge-patch, building a nested customFields
+# (and customMetadata) object from flexible spreadsheet input. Only the fields
+# provided per row are sent, so nothing else on the record is touched.
+# =============================================================================
+
+_SMART_QUOTES = {
+    "\u201c": '"', "\u201d": '"',   # “ ”
+    "\u2018": "'", "\u2019": "'",   # ‘ ’
+    "\u00a0": " ",                  # non-breaking space
+}
+
+
+def _normalise_quotes(s: str) -> str:
+    for bad, good in _SMART_QUOTES.items():
+        s = s.replace(bad, good)
+    return s
+
+
+def parse_object_cell(raw: str) -> dict:
+    """Parse one cell into a dict. Accepts JSON, single-quoted JSON, or
+    key=value / key:value pairs separated by ';' or newlines."""
+    s = _normalise_quotes(str(raw)).strip()
+    if not s:
+        return {}
+
+    # 1) strict JSON
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+
+    # 2) JSON with single quotes swapped for double quotes
+    if "'" in s and '"' not in s:
+        try:
+            obj = json.loads(s.replace("'", '"'))
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+
+    # 3) key=value / key:value pairs
+    body = s
+    if body.startswith("{") and body.endswith("}"):
+        body = body[1:-1]
+    result: Dict[str, str] = {}
+    for chunk in body.replace("\n", ";").split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        sep = "=" if "=" in chunk else (":" if ":" in chunk else None)
+        if sep is None:
+            raise ValueError(f"cannot parse fragment: {chunk!r}")
+        key, val = chunk.split(sep, 1)
+        key = key.strip().strip("\"'")
+        val = val.strip().strip("\"'")
+        if key:
+            result[key] = val
+    if not result:
+        raise ValueError(f"cannot parse value: {raw!r}")
+    return result
+
+
+def build_object_field(row: pd.Series, base_name: str) -> dict:
+    """Merge a '<base_name>' JSON/kv cell with any '<base_name>.<key>' columns.
+    Per-key dotted columns take precedence over the single cell."""
+    dotted: Dict[str, str] = {}
+    single_raw = ""
+    prefix = base_name.lower() + "."
+    for col, val in row.items():
+        c = str(col).strip()
+        if val is None or str(val).strip() == "":
+            continue
+        if c.lower() == base_name.lower():
+            single_raw = str(val)
+        elif c.lower().startswith(prefix):
+            dotted[c.split(".", 1)[1]] = str(val).strip()
+    merged: Dict[str, str] = {}
+    if single_raw.strip():
+        merged.update(parse_object_cell(single_raw))
+    merged.update(dotted)
+    return merged
+
+
+def _get_ci(row: pd.Series, name: str) -> str:
+    for col, val in row.items():
+        if str(col).strip().lower() == name.lower():
+            return "" if val is None else str(val).strip()
+    return ""
+
+
+def build_patch_body(row: pd.Series) -> Tuple[Optional[dict], str]:
+    """Build a merge-patch body from a spreadsheet row.
+    Returns (body, error). error is empty on success."""
+    external_id = _get_ci(row, "externalId")
+    if not external_id:
+        return None, "missing externalId"
+    try:
+        custom_fields = build_object_field(row, "customFields")
+        custom_metadata = build_object_field(row, "customMetadata")
+    except ValueError as exc:
+        return None, str(exc)
+    if not custom_fields and not custom_metadata:
+        return None, "no customFields/customMetadata value"
+
+    body: Dict[str, object] = {"externalId": external_id}
+    if custom_fields:
+        body["customFields"] = custom_fields
+    if custom_metadata:
+        body["customMetadata"] = custom_metadata
+    document_id = _get_ci(row, "documentId")
+    if document_id:
+        body["documentId"] = document_id
+    return body, ""
+
+
+def make_patch_template_csv() -> str:
+    df = pd.DataFrame([{
+        "externalId": "INV-001",
+        "documentId": "",
+        "customFields": '{"autoPosted":"true"}',
+    }])
+    return df.to_csv(index=False)
+
+
+def _patch_with_retry(url: str, headers: dict, body: dict, max_retries: int = 3):
+    """PATCH with light backoff on 429, honouring x-ratelimit-reset."""
+    resp = None
+    for attempt in range(max_retries + 1):
+        resp = requests.patch(url, headers=headers, json=body, timeout=60)
+        if resp.status_code == 429 and attempt < max_retries:
+            reset = resp.headers.get("x-ratelimit-reset")
+            try:
+                wait = int(reset)
+            except (TypeError, ValueError):
+                wait = min(2 ** attempt, 30)
+            time.sleep(max(wait, 1))
+            continue
+        return resp
+    return resp
+
+
+def page_patch(endpoint_key: str, config: dict, base_url: str,
+               token: str, extra_headers: Optional[dict]) -> None:
+    st.subheader(f"{config['label']} — Patch existing records")
+
+    if endpoint_key == "lookup-table-rows":
+        st.info(
+            "Patch mode isn't available for lookup table rows here. "
+            "Switch Mode back to Insert, or choose a different endpoint."
+        )
+        return
+
+    patch_headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/merge-patch+json",
+    }
+    if extra_headers:
+        patch_headers.update(extra_headers)
+
+    st.caption(
+        f"Sends `PATCH {config['path']}/{{externalId}}` per row as "
+        "`application/merge-patch+json`. Only the fields you provide are updated; "
+        "everything else on the record is left untouched."
+    )
+
+    with st.expander("How to fill the file", expanded=False):
+        st.markdown(
+            "- **externalId** (required): the record's externalId.\n"
+            "- **customFields**: the nested fields, in whichever style is easiest —\n"
+            "    - JSON: `{\"autoPosted\":\"true\"}`\n"
+            "    - key=value pairs: `autoPosted=true; reviewed=false`\n"
+            "    - one column per key: headers like `customFields.autoPosted`\n"
+            "- **customMetadata** (optional): same formats as customFields.\n"
+            "- **documentId** (optional): included in the patch when present.\n\n"
+            "Curly/smart quotes are normalised automatically, so Excel autocorrect "
+            "won't break the JSON. All sources are merged into one nested object."
+        )
+
+    template_csv = make_patch_template_csv().encode("utf-8")
+    st.download_button(
+        label="Download patch template CSV",
+        data=template_csv,
+        file_name=f"patch_template_{endpoint_key}.csv",
+        mime="text/csv",
+        key="patch_template_download",
+    )
+
+    uploaded = st.file_uploader(
+        "Upload CSV or Excel file (one row = one record to patch)",
+        type=["csv", "xlsx", "xls"],
+        key="patch_uploader",
+    )
+    if not uploaded:
+        return
+
+    try:
+        df = load_table(uploaded)
+    except Exception as exc:
+        st.error(f"Failed to read file: {exc}")
+        return
+
+    if not any(str(c).strip().lower() == "externalid" for c in df.columns):
+        st.error("The file must contain an **externalId** column.")
+        return
+
+    st.write(f"Preview ({len(df)} rows):")
+    st.dataframe(df.head(10), use_container_width=True)
+
+    with st.expander("Preview payloads (first 5 rows)", expanded=True):
+        for shown, (_, row) in enumerate(df.iterrows()):
+            if shown >= 5:
+                break
+            body, err = build_patch_body(row)
+            if err:
+                st.markdown(f"- row {_get_ci(row, 'externalId') or '?'}: skipped — {err}")
+            else:
+                st.code(json.dumps(body, ensure_ascii=False, indent=2), language="json")
+
+    throttle_ms = st.slider(
+        "Throttle between requests (ms)", min_value=0, max_value=2000,
+        value=0, step=50, key="patch_throttle",
+    )
+
+    if st.button(f"Patch {len(df)} record(s) on {config['path']}", key="patch_send"):
+        results = []
+        ok_count = 0
+        error_count = 0
+        skip_count = 0
+        progress = st.progress(0, text="Sending patches...")
+
+        for idx, (_, row) in enumerate(df.iterrows(), start=1):
+            body, err = build_patch_body(row)
+
+            if err:
+                skip_count += 1
+                results.append({
+                    "row": idx, "status_code": "—", "result": "SKIPPED",
+                    "externalId": _get_ci(row, "externalId"), "error": err,
+                })
+            else:
+                url = base_url.rstrip("/") + config["path"] + "/" + quote(str(body["externalId"]), safe="")
+                try:
+                    resp = _patch_with_retry(url, patch_headers, body)
+                    if resp.status_code < 300:
+                        ok_count += 1
+                        results.append({
+                            "row": idx, "status_code": resp.status_code, "result": "OK",
+                            "externalId": body["externalId"], "error": "",
+                        })
+                    else:
+                        error_count += 1
+                        results.append({
+                            "row": idx, "status_code": resp.status_code, "result": "ERROR",
+                            "externalId": body["externalId"], "error": resp.text[:2000],
+                        })
+                except Exception as exc:
+                    error_count += 1
+                    results.append({
+                        "row": idx, "status_code": "—", "result": "ERROR",
+                        "externalId": body["externalId"], "error": str(exc),
+                    })
+
+            if throttle_ms:
+                time.sleep(throttle_ms / 1000.0)
+            progress.progress(int(idx * 100 / len(df)), text=f"Sent {idx}/{len(df)}")
+
+        if error_count == 0 and skip_count == 0:
+            st.success(f"All {ok_count} patch(es) succeeded.")
+        else:
+            st.warning(f"Done. OK: {ok_count}, Errors: {error_count}, Skipped: {skip_count}")
+
+        results_df = pd.DataFrame(results)
+        st.dataframe(results_df, use_container_width=True)
+
+        results_csv = results_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Download results CSV",
+            data=results_csv,
+            file_name=f"patch_results_{endpoint_key}.csv",
+            mime="text/csv",
+            key="patch_results_download",
+        )
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -834,13 +1123,28 @@ def main():
         selected_label = st.selectbox("Endpoint", options=sorted_labels)
         endpoint_key = label_to_slug[selected_label]
 
+        mode = st.radio(
+            "Mode",
+            options=["Insert (POST)", "Patch existing (PATCH)"],
+            index=0,
+        )
+
     token = st.session_state.get("auth_token")
     if not token:
         st.info("Enter your credentials in the sidebar and click **Re-authenticate** to continue.")
         return
 
-    auth_headers = get_auth_headers(token, extra=st.session_state.get("extra_headers"))
-    page_endpoint(endpoint_key, ENDPOINT_CONFIG[endpoint_key], base_url, auth_headers)
+    if mode.startswith("Patch"):
+        page_patch(
+            endpoint_key,
+            ENDPOINT_CONFIG[endpoint_key],
+            base_url,
+            token,
+            st.session_state.get("extra_headers"),
+        )
+    else:
+        auth_headers = get_auth_headers(token, extra=st.session_state.get("extra_headers"))
+        page_endpoint(endpoint_key, ENDPOINT_CONFIG[endpoint_key], base_url, auth_headers)
 
 
 if __name__ == "__main__":
