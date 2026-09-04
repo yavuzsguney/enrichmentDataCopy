@@ -2,7 +2,9 @@ import io
 import json
 import math
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
 from typing import Dict, List, Optional, Tuple
 
@@ -904,11 +906,58 @@ def make_patch_template_csv() -> str:
     return df.to_csv(index=False)
 
 
-def _patch_with_retry(url: str, headers: dict, body: dict, max_retries: int = 3):
-    """PATCH with light backoff on 429, honouring x-ratelimit-reset."""
+class RateLimiter:
+    """Thread-safe tracker for the API's x-ratelimit-* headers.
+
+    Workers call wait_if_needed() before firing a request and pause
+    proactively once the server-reported quota is nearly exhausted,
+    instead of waiting to be told off with a 429."""
+
+    def __init__(self, min_buffer: int = 2):
+        self._lock = threading.Lock()
+        self._remaining: Optional[int] = None
+        self._reset_at: Optional[float] = None
+        self._min_buffer = min_buffer
+
+    def wait_if_needed(self):
+        with self._lock:
+            remaining = self._remaining
+            reset_at = self._reset_at
+        if remaining is not None and remaining <= self._min_buffer and reset_at:
+            wait = reset_at - time.time()
+            if wait > 0:
+                # Cap a single sleep so the UI/progress bar stays responsive
+                # and other threads get a chance to re-check after it.
+                time.sleep(min(wait, 60))
+
+    def update(self, headers: dict):
+        remaining_raw = headers.get("x-ratelimit-remaining")
+        reset_raw = headers.get("x-ratelimit-reset")
+        with self._lock:
+            if remaining_raw is not None:
+                try:
+                    self._remaining = int(remaining_raw)
+                except ValueError:
+                    pass
+            if reset_raw is not None:
+                try:
+                    self._reset_at = time.time() + int(reset_raw)
+                except ValueError:
+                    pass
+
+
+def _patch_with_retry(session: requests.Session, url: str, headers: dict, body: dict,
+                       rate_limiter: "RateLimiter", max_retries: int = 5):
+    """PATCH with proactive rate-limit pacing plus reactive backoff on 429.
+
+    Uses a shared Session for connection reuse (avoids a fresh TCP/TLS
+    handshake per request) and checks in with the shared RateLimiter both
+    before and after each call so concurrent workers stay under quota."""
     resp = None
     for attempt in range(max_retries + 1):
-        resp = requests.patch(url, headers=headers, json=body, timeout=60)
+        rate_limiter.wait_if_needed()
+        resp = session.patch(url, headers=headers, json=body, timeout=60)
+        rate_limiter.update(resp.headers)
         if resp.status_code == 429 and attempt < max_retries:
             reset = resp.headers.get("x-ratelimit-reset")
             try:
@@ -998,53 +1047,92 @@ def page_patch(endpoint_key: str, config: dict, base_url: str,
             else:
                 st.code(json.dumps(body, ensure_ascii=False, indent=2), language="json")
 
-    throttle_ms = st.slider(
-        "Throttle between requests (ms)", min_value=0, max_value=2000,
-        value=0, step=50, key="patch_throttle",
-    )
+    col_a, col_b = st.columns(2)
+    with col_a:
+        workers = st.slider(
+            "Concurrent requests", min_value=1, max_value=20, value=6, step=1,
+            key="patch_workers",
+            help=(
+                "How many patches to have in flight at once. Higher is faster "
+                "but leans harder on the API's rate limit — the automatic "
+                "pacing below handles that, but very high values mostly just "
+                "produce more 429s to recover from."
+            ),
+        )
+    with col_b:
+        throttle_ms = st.slider(
+            "Extra delay per request (ms)", min_value=0, max_value=2000,
+            value=0, step=50, key="patch_throttle",
+            help="Optional fixed pause before each request, on top of the automatic rate-limit pacing.",
+        )
 
     if st.button(f"Patch {len(df)} record(s) on {config['path']}", key="patch_send"):
-        results = []
+        # Reused across all requests: avoids a fresh TCP/TLS handshake per row.
+        session = requests.Session()
+        # Shared quota tracker; buffer scales with concurrency so workers
+        # start backing off before the whole pool slams into a 429 at once.
+        rate_limiter = RateLimiter(min_buffer=max(2, workers))
+
+        results: List[Optional[dict]] = [None] * len(df)
         ok_count = 0
         error_count = 0
         skip_count = 0
-        progress = st.progress(0, text="Sending patches...")
 
+        # Validate everything up front so we only pay network cost for real requests.
+        to_send: List[Tuple[int, dict, str]] = []
         for idx, (_, row) in enumerate(df.iterrows(), start=1):
             body, err = build_patch_body(row)
-
             if err:
                 skip_count += 1
-                results.append({
+                results[idx - 1] = {
                     "row": idx, "status_code": "—", "result": "SKIPPED",
                     "externalId": _get_ci(row, "externalId"), "error": err,
-                })
+                }
             else:
                 url = base_url.rstrip("/") + config["path"] + "/" + quote(str(body["externalId"]), safe="")
-                try:
-                    resp = _patch_with_retry(url, patch_headers, body)
-                    if resp.status_code < 300:
-                        ok_count += 1
-                        results.append({
-                            "row": idx, "status_code": resp.status_code, "result": "OK",
-                            "externalId": body["externalId"], "error": "",
-                        })
-                    else:
-                        error_count += 1
-                        results.append({
-                            "row": idx, "status_code": resp.status_code, "result": "ERROR",
-                            "externalId": body["externalId"], "error": resp.text[:2000],
-                        })
-                except Exception as exc:
-                    error_count += 1
-                    results.append({
-                        "row": idx, "status_code": "—", "result": "ERROR",
-                        "externalId": body["externalId"], "error": str(exc),
-                    })
+                to_send.append((idx, body, url))
 
+        def _do_patch(idx: int, body: dict, url: str):
             if throttle_ms:
                 time.sleep(throttle_ms / 1000.0)
-            progress.progress(int(idx * 100 / len(df)), text=f"Sent {idx}/{len(df)}")
+            try:
+                resp = _patch_with_retry(session, url, patch_headers, body, rate_limiter)
+                return idx, body, resp, None
+            except Exception as exc:
+                return idx, body, None, exc
+
+        total = len(df)
+        completed = skip_count
+        progress = st.progress(
+            int(completed * 100 / total) if total else 0,
+            text=f"Sent {completed}/{total}",
+        )
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_do_patch, idx, body, url) for idx, body, url in to_send]
+            for future in as_completed(futures):
+                idx, body, resp, exc = future.result()
+                if exc is not None:
+                    error_count += 1
+                    results[idx - 1] = {
+                        "row": idx, "status_code": "—", "result": "ERROR",
+                        "externalId": body.get("externalId", ""), "error": str(exc),
+                    }
+                elif resp.status_code < 300:
+                    ok_count += 1
+                    results[idx - 1] = {
+                        "row": idx, "status_code": resp.status_code, "result": "OK",
+                        "externalId": body["externalId"], "error": "",
+                    }
+                else:
+                    error_count += 1
+                    results[idx - 1] = {
+                        "row": idx, "status_code": resp.status_code, "result": "ERROR",
+                        "externalId": body["externalId"], "error": resp.text[:2000],
+                    }
+
+                completed += 1
+                progress.progress(int(completed * 100 / total), text=f"Sent {completed}/{total}")
 
         if error_count == 0 and skip_count == 0:
             st.success(f"All {ok_count} patch(es) succeeded.")
