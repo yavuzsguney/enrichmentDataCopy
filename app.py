@@ -1153,6 +1153,319 @@ def page_patch(endpoint_key: str, config: dict, base_url: str,
 
 
 # =============================================================================
+# DELETE SUPPORT (added)
+# Batch-remove existing records via DELETE /<resource>/{externalId}. Per the
+# API reference these return 204 on success and 404 when the externalId is not
+# present, so 404 is reported as its own NOT_FOUND outcome rather than a hard
+# error. Invoices and purchase orders additionally accept an optional
+# lineNumber query parameter; omitting it removes the whole record.
+# =============================================================================
+
+# Endpoints whose delete operation supports the optional `lineNumber` query param.
+DELETE_LINE_NUMBER_ENDPOINTS = {"invoices", "purchase-orders"}
+
+
+def build_delete_target(row: pd.Series, endpoint_key: str) -> Tuple[Optional[dict], str]:
+    """Build the delete target (externalId + optional lineNumber) from a row.
+    Returns (target, error). error is empty on success."""
+    external_id = _get_ci(row, "externalId")
+    if not external_id:
+        return None, "missing externalId"
+
+    target: Dict[str, str] = {"externalId": external_id}
+    if endpoint_key in DELETE_LINE_NUMBER_ENDPOINTS:
+        line_number = _get_ci(row, "lineNumber")
+        if line_number:
+            target["lineNumber"] = line_number
+    return target, ""
+
+
+def make_delete_template_csv(endpoint_key: str, config: dict) -> str:
+    """Return a CSV with the columns the delete mode reads, using the
+    endpoint's own example externalId from its template_row."""
+    row: Dict[str, str] = {
+        "externalId": config["template_row"].get("externalId", "EXT-001"),
+    }
+    if endpoint_key in DELETE_LINE_NUMBER_ENDPOINTS:
+        row["lineNumber"] = ""
+    return pd.DataFrame([row]).to_csv(index=False)
+
+
+def _delete_with_retry(session: requests.Session, url: str, headers: dict,
+                       params: Optional[dict], rate_limiter: "RateLimiter",
+                       max_retries: int = 5):
+    """DELETE with proactive rate-limit pacing plus reactive backoff on 429.
+
+    Mirrors _patch_with_retry: shared Session for connection reuse, and checks
+    in with the shared RateLimiter before and after each call so concurrent
+    workers stay under quota."""
+    resp = None
+    for attempt in range(max_retries + 1):
+        rate_limiter.wait_if_needed()
+        resp = session.delete(url, headers=headers, params=params or None, timeout=60)
+        rate_limiter.update(resp.headers)
+        if resp.status_code == 429 and attempt < max_retries:
+            reset = resp.headers.get("x-ratelimit-reset")
+            try:
+                wait = int(reset)
+            except (TypeError, ValueError):
+                wait = min(2 ** attempt, 30)
+            time.sleep(max(wait, 1))
+            continue
+        return resp
+    return resp
+
+
+def page_delete(endpoint_key: str, config: dict, base_url: str,
+                token: str, extra_headers: Optional[dict]) -> None:
+    st.subheader(f"{config['label']} — Delete existing records")
+
+    # Lookup table rows are addressed as /<path>/{type}/{externalId}, so the
+    # type must be picked before any URL can be built (same as Insert mode).
+    lookup_type = ""
+    if endpoint_key == "lookup-table-rows":
+        type_choice = st.selectbox(
+            "Lookup table type",
+            options=["payment_terms", "tax_codes", "central_bank_indicator", "custom"],
+            index=0,
+            key="delete_lookup_type",
+        )
+        if type_choice == "custom":
+            raw_custom = st.text_input(
+                "Custom lookup table type",
+                placeholder="my_table",
+                help="Letters, numbers, underscore only. Spaces become underscores.",
+                key="delete_lookup_type_custom",
+            )
+            lookup_type = _slugify_type(raw_custom)
+            if raw_custom and not lookup_type:
+                st.error("Invalid custom type. Use only letters, numbers, or underscores.")
+        else:
+            lookup_type = type_choice
+
+        if not lookup_type:
+            st.info("Enter a valid lookup table type to continue.")
+            return
+
+    collection_url = resolve_endpoint_url(endpoint_key, config, base_url, lookup_type)
+
+    delete_headers = {"Authorization": f"Bearer {token}"}
+    if extra_headers:
+        delete_headers.update(extra_headers)
+
+    st.caption(
+        f"Sends `DELETE {collection_url.replace(base_url.rstrip('/'), '')}/{{externalId}}` "
+        "per row. This permanently removes the record from the Enrichment "
+        "Service database — it cannot be undone."
+    )
+    st.warning(
+        "Deletion is irreversible. Check the Base URL and Client ID in the "
+        "sidebar point at the environment you intend to change before sending."
+    )
+
+    with st.expander("How to fill the file", expanded=False):
+        lines = [
+            "- **externalId** (required): the externalId of the record to delete. "
+            "One row per record.",
+        ]
+        if endpoint_key in DELETE_LINE_NUMBER_ENDPOINTS:
+            lines.append(
+                "- **lineNumber** (optional): deletes only that line of the record. "
+                "Leave empty to delete the whole record."
+            )
+        lines.append(
+            "\nAny other columns in the file are ignored. `204` means deleted, "
+            "`404` means the externalId was not found — reported separately so a "
+            "missing record doesn't read as a failure."
+        )
+        st.markdown("\n".join(lines))
+
+    template_csv = make_delete_template_csv(endpoint_key, config).encode("utf-8")
+    st.download_button(
+        label="Download delete template CSV",
+        data=template_csv,
+        file_name=f"delete_template_{endpoint_key}.csv",
+        mime="text/csv",
+        key="delete_template_download",
+    )
+
+    uploaded = st.file_uploader(
+        "Upload CSV or Excel file (one row = one record to delete)",
+        type=["csv", "xlsx", "xls"],
+        key="delete_uploader",
+    )
+    if not uploaded:
+        return
+
+    try:
+        df = load_table(uploaded)
+    except Exception as exc:
+        st.error(f"Failed to read file: {exc}")
+        return
+
+    if not any(str(c).strip().lower() == "externalid" for c in df.columns):
+        st.error("The file must contain an **externalId** column.")
+        return
+
+    st.write(f"Preview ({len(df)} rows):")
+    st.dataframe(df.head(10), use_container_width=True)
+
+    with st.expander("Preview delete URLs (first 5 rows)", expanded=True):
+        for shown, (_, row) in enumerate(df.iterrows()):
+            if shown >= 5:
+                break
+            target, err = build_delete_target(row, endpoint_key)
+            if err:
+                st.markdown(f"- row {_get_ci(row, 'externalId') or '?'}: skipped — {err}")
+            else:
+                preview_url = collection_url + "/" + quote(str(target["externalId"]), safe="")
+                if target.get("lineNumber"):
+                    preview_url += f"?lineNumber={quote(str(target['lineNumber']), safe='')}"
+                st.code(f"DELETE {preview_url}", language="text")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        workers = st.slider(
+            "Concurrent requests", min_value=1, max_value=20, value=6, step=1,
+            key="delete_workers",
+            help=(
+                "How many deletes to have in flight at once. Higher is faster "
+                "but leans harder on the API's rate limit — the automatic "
+                "pacing below handles that, but very high values mostly just "
+                "produce more 429s to recover from."
+            ),
+        )
+    with col_b:
+        throttle_ms = st.slider(
+            "Extra delay per request (ms)", min_value=0, max_value=2000,
+            value=0, step=50, key="delete_throttle",
+            help="Optional fixed pause before each request, on top of the automatic rate-limit pacing.",
+        )
+
+    # Deliberate second step: the button stays disabled until this is ticked,
+    # so a stray click can't wipe records.
+    confirmed = st.checkbox(
+        f"I understand this permanently deletes up to {len(df)} record(s) "
+        f"from {base_url.rstrip('/')}",
+        key="delete_confirm",
+    )
+
+    if st.button(
+        f"Delete {len(df)} record(s) on {config['path']}",
+        key="delete_send",
+        disabled=not confirmed,
+    ):
+        # Reused across all requests: avoids a fresh TCP/TLS handshake per row.
+        session = requests.Session()
+        # Shared quota tracker; buffer scales with concurrency so workers
+        # start backing off before the whole pool slams into a 429 at once.
+        rate_limiter = RateLimiter(min_buffer=max(2, workers))
+
+        results: List[Optional[dict]] = [None] * len(df)
+        ok_count = 0
+        error_count = 0
+        skip_count = 0
+        not_found_count = 0
+
+        # Validate everything up front so we only pay network cost for real requests.
+        to_send: List[Tuple[int, dict, str, dict]] = []
+        for idx, (_, row) in enumerate(df.iterrows(), start=1):
+            target, err = build_delete_target(row, endpoint_key)
+            if err:
+                skip_count += 1
+                results[idx - 1] = {
+                    "row": idx, "status_code": "—", "result": "SKIPPED",
+                    "externalId": _get_ci(row, "externalId"),
+                    "lineNumber": _get_ci(row, "lineNumber"), "error": err,
+                }
+            else:
+                url = collection_url + "/" + quote(str(target["externalId"]), safe="")
+                params = (
+                    {"lineNumber": target["lineNumber"]}
+                    if target.get("lineNumber") else {}
+                )
+                to_send.append((idx, target, url, params))
+
+        def _do_delete(idx: int, target: dict, url: str, params: dict):
+            if throttle_ms:
+                time.sleep(throttle_ms / 1000.0)
+            try:
+                resp = _delete_with_retry(session, url, delete_headers, params, rate_limiter)
+                return idx, target, resp, None
+            except Exception as exc:
+                return idx, target, None, exc
+
+        total = len(df)
+        completed = skip_count
+        progress = st.progress(
+            int(completed * 100 / total) if total else 0,
+            text=f"Sent {completed}/{total}",
+        )
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(_do_delete, idx, target, url, params)
+                for idx, target, url, params in to_send
+            ]
+            for future in as_completed(futures):
+                idx, target, resp, exc = future.result()
+                base_result = {
+                    "row": idx,
+                    "externalId": target.get("externalId", ""),
+                    "lineNumber": target.get("lineNumber", ""),
+                }
+                if exc is not None:
+                    error_count += 1
+                    results[idx - 1] = {
+                        **base_result, "status_code": "—",
+                        "result": "ERROR", "error": str(exc),
+                    }
+                elif resp.status_code == 404:
+                    # Documented response when the externalId isn't present.
+                    # Not a failure of the request, so it's counted separately.
+                    not_found_count += 1
+                    results[idx - 1] = {
+                        **base_result, "status_code": resp.status_code,
+                        "result": "NOT_FOUND", "error": "",
+                    }
+                elif resp.status_code < 300:
+                    ok_count += 1
+                    results[idx - 1] = {
+                        **base_result, "status_code": resp.status_code,
+                        "result": "DELETED", "error": "",
+                    }
+                else:
+                    error_count += 1
+                    results[idx - 1] = {
+                        **base_result, "status_code": resp.status_code,
+                        "result": "ERROR", "error": resp.text[:2000],
+                    }
+
+                completed += 1
+                progress.progress(int(completed * 100 / total), text=f"Sent {completed}/{total}")
+
+        if error_count == 0 and skip_count == 0 and not_found_count == 0:
+            st.success(f"All {ok_count} record(s) deleted.")
+        else:
+            st.warning(
+                f"Done. Deleted: {ok_count}, Not found: {not_found_count}, "
+                f"Errors: {error_count}, Skipped: {skip_count}"
+            )
+
+        results_df = pd.DataFrame(results)
+        st.dataframe(results_df, use_container_width=True)
+
+        results_csv = results_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Download results CSV",
+            data=results_csv,
+            file_name=f"delete_results_{endpoint_key}.csv",
+            mime="text/csv",
+            key="delete_results_download",
+        )
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -1213,7 +1526,7 @@ def main():
 
         mode = st.radio(
             "Mode",
-            options=["Insert (POST)", "Patch existing (PATCH)"],
+            options=["Insert (POST)", "Patch existing (PATCH)", "Delete existing (DELETE)"],
             index=0,
         )
 
@@ -1224,6 +1537,14 @@ def main():
 
     if mode.startswith("Patch"):
         page_patch(
+            endpoint_key,
+            ENDPOINT_CONFIG[endpoint_key],
+            base_url,
+            token,
+            st.session_state.get("extra_headers"),
+        )
+    elif mode.startswith("Delete"):
+        page_delete(
             endpoint_key,
             ENDPOINT_CONFIG[endpoint_key],
             base_url,
